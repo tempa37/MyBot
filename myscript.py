@@ -34,6 +34,23 @@ import numpy as np
 
 
 # ----------------------------
+# QUICK TUNING (edit values here)
+# ----------------------------
+# Это главный блок для ручной настройки поведения бота прямо в файле.
+# Можно менять значения ниже без поиска по всему скрипту.
+#
+# CONFIDENCE_THRESHOLD: минимальная уверенность сигнала (чем выше, тем строже фильтр).
+# MIN_MARGIN: минимальный отрыв лучшего направления (UP/DOWN) от альтернативы.
+# MIN_TRADES_60S: минимальное число сделок за 60с для подтверждения активности.
+#
+# Быстрый ориентир по текущим ключевым значениям:
+# CONFIDENCE_THRESHOLD=82;MIN_MARGIN=14;MIN_TRADES_60S=10
+CONFIDENCE_THRESHOLD_DEFAULT = 82.0
+MIN_MARGIN_DEFAULT = 14.0
+MIN_TRADES_60S_DEFAULT = 10
+
+
+# ----------------------------
 # Config
 # ----------------------------
 
@@ -61,15 +78,15 @@ class Config:
     candles_1m_maxlen: int = 400
 
     # Filters for "не спорно"
-    min_trades_60s: int = 20
+    min_trades_60s: int = MIN_TRADES_60S_DEFAULT
     min_volume_60s: float = 0.0  # можно поднять, если хочешь отсечь тонкие
     min_1m_candles_ready: int = 30
     min_1s_bars_ready: int = 120
 
     # Signal strictness
-    confidence_threshold: float = 86.0
+    confidence_threshold: float = CONFIDENCE_THRESHOLD_DEFAULT
     min_score_threshold: float = 75.0
-    min_margin: float = 18.0          # best_score - other_score
+    min_margin: float = MIN_MARGIN_DEFAULT          # best_score - other_score
     cooldown_secs: int = 180          # per symbol+direction
 
     # Evaluation throttle
@@ -81,6 +98,7 @@ class Config:
 
     # Output
     log_path: str = "scalp_signals.log"
+    debug_print_interval_secs: float = 10.0
 
 
 # ----------------------------
@@ -701,6 +719,28 @@ class BybitWSBot:
         self.states: Dict[str, SymbolState] = {}
         self.topics: List[str] = []
         self._stop = False
+        self.msg_stats: Dict[str, int] = {
+            "tickers": 0,
+            "trades": 0,
+            "kline_1m": 0,
+            "liq": 0,
+            "signals": 0,
+        }
+        self.last_debug_ts: float = 0.0
+
+    def _print_debug(self):
+        now = time.time()
+        if (now - self.last_debug_ts) < self.cfg.debug_print_interval_secs:
+            return
+        self.last_debug_ts = now
+
+        active_symbols = sum(1 for st in self.states.values() if st.bars_1s or st.candles_1m or st.ticker)
+        print(
+            "_________ "
+            f"flow tickers={self.msg_stats['tickers']} trades={self.msg_stats['trades']} "
+            f"kline_1m={self.msg_stats['kline_1m']} liq={self.msg_stats['liq']} "
+            f"signals={self.msg_stats['signals']} active_symbols={active_symbols}/{len(self.states)}"
+        )
 
     def _make_topics(self, symbols: List[str]) -> List[str]:
         out = []
@@ -918,6 +958,7 @@ class BybitWSBot:
 
                         self.topics = self._make_topics(symbols)
                         print(f"Universe updated: {len(symbols)} symbols, topics={len(self.topics)}")
+                        print("_________ WS connected, waiting for market data...")
 
                     async with session.ws_connect(cfg.ws_url, heartbeat=None, autoping=False) as ws:
                         self._stop = False
@@ -944,6 +985,7 @@ class BybitWSBot:
 
                                 # Ticker / Trade / Kline / Liquidation messages
                                 if topic.startswith("tickers."):
+                                    self.msg_stats["tickers"] += 1
                                     payload = data.get("data")
                                     ts_ms = data.get("ts")
                                     if isinstance(payload, dict):
@@ -958,6 +1000,7 @@ class BybitWSBot:
                                                     self._merge_ticker(self.states[sym], item, ts_ms if isinstance(ts_ms, int) else None)
 
                                 elif topic.startswith("publicTrade."):
+                                    self.msg_stats["trades"] += 1
                                     payload = data.get("data")
                                     if isinstance(payload, list) and payload:
                                         # symbol can be in each trade item, but topic also carries it
@@ -974,6 +1017,7 @@ class BybitWSBot:
                                             if sym in self.states:
                                                 sig = evaluate(cfg, self.states[sym])
                                                 if sig:
+                                                    self.msg_stats["signals"] += 1
                                                     print(sig.to_text())
                                                     try:
                                                         with open(cfg.log_path, "a", encoding="utf-8") as f:
@@ -982,6 +1026,7 @@ class BybitWSBot:
                                                         pass
 
                                 elif topic.startswith("kline.1."):
+                                    self.msg_stats["kline_1m"] += 1
                                     payload = data.get("data")
                                     if isinstance(payload, list):
                                         for k in payload:
@@ -993,6 +1038,7 @@ class BybitWSBot:
                                                 self._on_kline_1m(self.states[sym], k)
 
                                 elif topic.startswith("allLiquidation."):
+                                    self.msg_stats["liq"] += 1
                                     payload = data.get("data")
                                     sym = topic.split(".")[-1]
                                     if sym in self.states:
@@ -1002,6 +1048,8 @@ class BybitWSBot:
                                                     self._on_liq(self.states[sym], liq)
                                         elif isinstance(payload, dict):
                                             self._on_liq(self.states[sym], payload)
+
+                                self._print_debug()
 
                             elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED):
                                 break
@@ -1057,6 +1105,7 @@ def load_config() -> Config:
     cfg.ping_interval_secs = int(os.getenv("PING_INTERVAL_SECS", cfg.ping_interval_secs))
 
     cfg.log_path = os.getenv("LOG_PATH", cfg.log_path)
+    cfg.debug_print_interval_secs = float(os.getenv("DEBUG_PRINT_INTERVAL_SECS", cfg.debug_print_interval_secs))
     return cfg
 
 
