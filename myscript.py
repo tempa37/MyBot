@@ -99,6 +99,7 @@ class Config:
     # Output
     log_path: str = "scalp_signals.log"
     debug_print_interval_secs: float = 10.0
+    forced_signal_interval_secs: int = 240
 
 
 # ----------------------------
@@ -676,6 +677,92 @@ def evaluate(cfg: Config, st: SymbolState) -> Optional[Signal]:
     )
 
 
+def evaluate_best_effort(st: SymbolState) -> Optional[Signal]:
+    """Всегда пытаемся собрать "лучший" сигнал по символу без жестких гейтов."""
+    now = time.time()
+
+    last_price = _sf(st.ticker.get("lastPrice"))
+    bid = _sf(st.ticker.get("bid1Price"))
+    ask = _sf(st.ticker.get("ask1Price"))
+    if not (math.isfinite(last_price) and math.isfinite(bid) and math.isfinite(ask) and ask > 0 and bid > 0):
+        return None
+
+    spread_pct = (ask - bid) / ((bid + ask) / 2.0)
+
+    if len(st.candles_1m) < 20 or len(st.bars_1s) < 61:
+        return None
+
+    c1m = np.array([c.c for c in st.candles_1m], dtype=float)
+    c1s = np.array([b.c for b in st.bars_1s], dtype=float)
+    buy1s = np.array([b.buy_v for b in st.bars_1s], dtype=float)
+    sell1s = np.array([b.sell_v for b in st.bars_1s], dtype=float)
+
+    ema9 = ema_last(c1m[-120:], 9)
+    ema21 = ema_last(c1m[-120:], 21)
+    mom10 = (c1s[-1] / c1s[-11] - 1.0) if len(c1s) >= 11 else 0.0
+    mom60 = (c1s[-1] / c1s[-61] - 1.0) if len(c1s) >= 61 else 0.0
+
+    buy30 = float(np.sum(buy1s[-30:]))
+    sell30 = float(np.sum(sell1s[-30:]))
+    total30 = buy30 + sell30
+    imbalance30 = (buy30 / total30) if total30 > 0 else 0.5
+
+    up = 0.0
+    dn = 0.0
+    reasons_up: List[str] = []
+    reasons_dn: List[str] = []
+
+    if math.isfinite(ema9) and math.isfinite(ema21):
+        if ema9 > ema21:
+            up += 22
+            reasons_up.append("EMA9>EMA21")
+        elif ema9 < ema21:
+            dn += 22
+            reasons_dn.append("EMA9<EMA21")
+
+    if mom10 > 0:
+        up += min(18, abs(mom10) * 18000)
+        reasons_up.append(f"10S MOM {mom10*100:.2f}%")
+    elif mom10 < 0:
+        dn += min(18, abs(mom10) * 18000)
+        reasons_dn.append(f"10S MOM {mom10*100:.2f}%")
+
+    if mom60 > 0:
+        up += min(24, abs(mom60) * 12000)
+        reasons_up.append(f"60S MOM {mom60*100:.2f}%")
+    elif mom60 < 0:
+        dn += min(24, abs(mom60) * 12000)
+        reasons_dn.append(f"60S MOM {mom60*100:.2f}%")
+
+    if imbalance30 > 0.5:
+        up += (imbalance30 - 0.5) * 40
+        reasons_up.append(f"BUY FLOW {imbalance30:.2f}")
+    elif imbalance30 < 0.5:
+        dn += (0.5 - imbalance30) * 40
+        reasons_dn.append(f"SELL FLOW {imbalance30:.2f}")
+
+    best_dir = "UP" if up >= dn else "DOWN"
+    best = max(up, dn)
+    other = min(up, dn)
+    margin = best - other
+    confidence = max(35.0, min(99.0, 50.0 + margin))
+
+    reasons = reasons_up if best_dir == "UP" else reasons_dn
+    if not reasons:
+        reasons = ["LOW-EDGE SNAPSHOT"]
+
+    return Signal(
+        ts=now,
+        symbol=st.symbol,
+        direction=best_dir,
+        confidence=confidence,
+        price=last_price,
+        spread_pct=spread_pct,
+        reasons=reasons,
+        debug={"up_score": up, "down_score": dn, "best_effort": True},
+    )
+
+
 # ----------------------------
 # Universe selection (малопопулярные)
 # ----------------------------
@@ -727,6 +814,7 @@ class BybitWSBot:
             "signals": 0,
         }
         self.last_debug_ts: float = 0.0
+        self.last_forced_signal_ts: float = 0.0
 
     def _print_debug(self):
         now = time.time()
@@ -750,6 +838,47 @@ class BybitWSBot:
             out.append(f"kline.1.{s}")
             out.append(f"allLiquidation.{s}")
         return out
+
+    def _emit_forced_top_signal(self):
+        now = time.time()
+        if (now - self.last_forced_signal_ts) < self.cfg.forced_signal_interval_secs:
+            return
+
+        best: Optional[Signal] = None
+        for st in self.states.values():
+            cand = evaluate_best_effort(st)
+            if cand is None:
+                continue
+            if (best is None) or (cand.confidence > best.confidence):
+                best = cand
+
+        self.last_forced_signal_ts = now
+
+        if best is None:
+            print("🔥 TOP SIGNAL: NO READY SYMBOLS YET (NOT ENOUGH DATA)")
+            return
+
+        print(
+            "🔥 TOP SIGNAL 4M | "
+            f"{best.direction} {best.symbol} | CONFIDENCE={best.confidence:.1f}% | "
+            f"PRICE={best.price:g} | SPREAD={best.spread_pct*100:.2f}%"
+        )
+        try:
+            payload = {
+                "forced_top_signal": True,
+                "ts": best.ts,
+                "symbol": best.symbol,
+                "direction": best.direction,
+                "confidence": best.confidence,
+                "price": best.price,
+                "spread_pct": best.spread_pct,
+                "reasons": best.reasons,
+                "debug": best.debug,
+            }
+            with open(self.cfg.log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
 
     async def _seed_1m_history(self, rest: BybitRest, symbols: List[str]) -> None:
         # concurrency-limited seeding
@@ -1050,6 +1179,7 @@ class BybitWSBot:
                                             self._on_liq(self.states[sym], payload)
 
                                 self._print_debug()
+                                self._emit_forced_top_signal()
 
                             elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED):
                                 break
@@ -1106,6 +1236,7 @@ def load_config() -> Config:
 
     cfg.log_path = os.getenv("LOG_PATH", cfg.log_path)
     cfg.debug_print_interval_secs = float(os.getenv("DEBUG_PRINT_INTERVAL_SECS", cfg.debug_print_interval_secs))
+    cfg.forced_signal_interval_secs = int(os.getenv("FORCED_SIGNAL_INTERVAL_SECS", cfg.forced_signal_interval_secs))
     return cfg
 
 
